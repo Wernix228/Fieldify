@@ -8,12 +8,11 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Message
 from telethon.errors import MessageNotModifiedError
 import spacy
-from pymongo import MongoClient
-from pymongo.errors import ConnectionError as MongoConnectionError
 from pydantic import BaseModel
 import threading
 import queue
 from nlp_processor import NLPProcessor
+from database import session, Message as DBMessage, ChatConfig as DBChatConfig
 
 # Load environment variables
 load_dotenv()
@@ -32,25 +31,6 @@ except Exception as e:
     logger.error(f"Failed to initialize NLP processor: {e}")
     nlp_processor = None
 
-# MongoDB connection
-try:
-    mongo_uri = os.getenv("MONGODB_URI")
-    if not mongo_uri:
-        raise ValueError("MONGODB_URI environment variable is not set")
-    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-    # Test the connection
-    client.server_info()
-    db = client.telegram_bot
-    messages_collection = db.messages
-    chat_configs_collection = db.chat_configs
-    logger.info("Successfully connected to MongoDB")
-except MongoConnectionError as e:
-    logger.error(f"MongoDB connection error: {e}")
-    raise
-except Exception as e:
-    logger.error(f"Unexpected error connecting to MongoDB: {e}")
-    raise
-
 class TagConfig(BaseModel):
     tag: str
     field: str
@@ -67,6 +47,7 @@ class ChatManager:
     def __init__(self, client: TelegramClient):
         self.client = client
         self.tag_configs: Dict[int, List[TagConfig]] = {}
+        self.chat_configs: Dict[int, ChatConfig] = {}
         self.default_tags = {
             "Дата:": "date",
             "Адрес:": "address",
@@ -79,11 +60,12 @@ class ChatManager:
     def load_chat_configs(self):
         """Загружает конфигурации чатов из базы данных"""
         try:
-            configs = chat_configs_collection.find({})
+            configs = session.query(DBChatConfig).all()
             for config in configs:
-                chat_id = config['chat_id']
+                chat_id = config.chat_id
                 self.tag_configs[chat_id] = [
-                    TagConfig(**tag_config) for tag_config in config.get('tag_configs', [])
+                    TagConfig(tag=tag, field=field, is_active=True)
+                    for tag, field in config.tags.items()
                 ]
         except Exception as e:
             logger.error(f"Error loading chat configs: {e}")
@@ -91,16 +73,16 @@ class ChatManager:
     def save_chat_config(self, chat_id: int):
         """Сохраняет конфигурацию чата в базу данных"""
         try:
-            chat_configs_collection.update_one(
-                {'chat_id': chat_id},
-                {'$set': {
-                    'chat_id': chat_id,
-                    'tag_configs': [tag.dict() for tag in self.tag_configs.get(chat_id, [])]
-                }},
-                upsert=True
-            )
+            config = session.query(DBChatConfig).filter_by(chat_id=chat_id).first()
+            if not config:
+                config = DBChatConfig(chat_id=chat_id)
+                session.add(config)
+            
+            config.tags = {tag.tag: tag.field for tag in self.tag_configs.get(chat_id, [])}
+            session.commit()
         except Exception as e:
             logger.error(f"Error saving chat config: {e}")
+            session.rollback()
 
     async def handle_config_command(self, event: events.NewMessage.Event):
         """Обрабатывает команду /config"""
@@ -111,114 +93,76 @@ class ChatManager:
             if not message.text.startswith('/config'):
                 return
 
-            # Показываем меню конфигурации
-            keyboard = [
-                [
-                    {"text": "Управление метками", "callback_data": "manage_tags"},
-                    {"text": "Настройки NLP", "callback_data": "nlp_settings"}
-                ],
-                [
-                    {"text": "Порог дубликатов", "callback_data": "duplicate_threshold"},
-                    {"text": "Статус бота", "callback_data": "bot_status"}
-                ]
-            ]
-            
-            await self.client.send_message(
-                chat_id,
-                "Выберите настройку для изменения:",
-                buttons=keyboard
+            help_text = (
+                "Доступные команды:\n"
+                "/config - показать это сообщение\n"
+                "/tags - управление метками\n"
+                "/add_tag метка:поле - добавить новую метку\n"
+                "/toggle_tag метка - включить/выключить метку\n"
+                "/nlp on/off - включить/выключить NLP\n"
+                "/threshold 0.7 - установить порог дубликатов\n"
+                "/status - показать статус бота\n"
+                "/data [limit] - показать последние извлеченные данные (по умолчанию 10)\n"
+                "/data_chat chat_id [limit] - показать данные для конкретного чата\n"
+                "/export - экспортировать все данные в CSV файл"
             )
+            
+            await event.reply(help_text)
         except Exception as e:
             logger.error(f"Error in handle_config_command: {e}")
             await event.reply("Произошла ошибка при обработке команды. Попробуйте позже.")
 
-    async def handle_tag_management(self, event: events.CallbackQuery.Event):
-        """Обрабатывает управление метками"""
+    async def handle_tags_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /tags"""
         try:
-            chat_id = event.chat_id
+            message: Message = event.message
+            chat_id = message.chat_id
             
+            if not message.text.startswith('/tags'):
+                return
+                
             if chat_id not in self.tag_configs:
                 self.tag_configs[chat_id] = [
                     TagConfig(tag=tag, field=field, is_active=True)
                     for tag, field in self.default_tags.items()
                 ]
 
-            buttons = []
+            tags_text = "Управление метками:\n✅ - активна\n❌ - неактивна\n\n"
             for tag_config in self.tag_configs[chat_id]:
                 status = "✅" if tag_config.is_active else "❌"
-                buttons.append([
-                    {"text": f"{status} {tag_config.tag} -> {tag_config.field}", 
-                     "callback_data": f"toggle_tag_{tag_config.tag}"}
-                ])
+                tags_text += f"{status} {tag_config.tag} -> {tag_config.field}\n"
             
-            buttons.append([
-                {"text": "Добавить метку", "callback_data": "add_tag"},
-                {"text": "Назад", "callback_data": "back_to_main"}
-            ])
+            tags_text += "\nИспользуйте /toggle_tag метка для включения/выключения метки"
+            tags_text += "\nИспользуйте /add_tag метка:поле для добавления новой метки"
             
-            await event.edit(
-                "Управление метками:\n✅ - активна\n❌ - неактивна",
-                buttons=buttons
-            )
-        except MessageNotModifiedError:
-            pass
+            await event.reply(tags_text)
         except Exception as e:
-            logger.error(f"Error in handle_tag_management: {e}")
-            await event.answer("Произошла ошибка. Попробуйте позже.")
+            logger.error(f"Error in handle_tags_command: {e}")
+            await event.reply("Произошла ошибка. Попробуйте позже.")
 
-    async def toggle_tag(self, event: events.CallbackQuery.Event, tag: str):
-        """Переключает состояние метки"""
+    async def handle_add_tag_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /add_tag"""
         try:
-            chat_id = event.chat_id
+            message: Message = event.message
+            chat_id = message.chat_id
             
-            if chat_id not in self.tag_configs:
-                await event.answer("Конфигурация чата не найдена")
+            if not message.text.startswith('/add_tag'):
                 return
                 
-            tag_found = False
-            for tag_config in self.tag_configs[chat_id]:
-                if tag_config.tag == tag:
-                    tag_config.is_active = not tag_config.is_active
-                    tag_found = True
-                    break
-            
-            if not tag_found:
-                await event.answer("Метка не найдена")
+            # Извлекаем параметры команды
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.reply(
+                    "Неверный формат. Используйте формат:\n"
+                    "/add_tag метка:поле\n"
+                    "Например: /add_tag Дата:date"
+                )
                 return
                 
-            self.save_chat_config(chat_id)
-            await self.handle_tag_management(event)
-        except Exception as e:
-            logger.error(f"Error in toggle_tag: {e}")
-            await event.answer("Произошла ошибка при переключении метки")
-
-    async def add_tag(self, event: events.CallbackQuery.Event):
-        """Начинает процесс добавления новой метки"""
-        try:
-            chat_id = event.chat_id
-            self.waiting_for_tag[chat_id] = True
-            
-            await event.edit(
-                "Введите новую метку в формате:\n"
-                "метка:поле\n"
-                "Например: Дата:date"
-            )
-        except Exception as e:
-            logger.error(f"Error in add_tag: {e}")
-            await event.answer("Произошла ошибка при добавлении метки")
-
-    async def process_new_tag(self, event: events.NewMessage.Event):
-        """Обрабатывает новую метку"""
-        try:
-            chat_id = event.chat_id
-            
-            if not self.waiting_for_tag.get(chat_id, False):
-                return
-                
-            text = event.message.text
+            tag_param = parts[1]
             
             try:
-                tag, field = text.split(":")
+                tag, field = tag_param.split(":")
                 new_config = TagConfig(tag=tag.strip(), field=field.strip(), is_active=True)
                 
                 if chat_id not in self.tag_configs:
@@ -230,21 +174,430 @@ class ChatManager:
                     return
                 
                 self.tag_configs[chat_id].append(new_config)
-                self.waiting_for_tag[chat_id] = False
                 self.save_chat_config(chat_id)
                 
                 await event.reply(f"Метка {tag} успешно добавлена!")
-                await self.handle_tag_management(event)
                 
             except ValueError:
                 await event.reply(
                     "Неверный формат. Используйте формат:\n"
-                    "метка:поле\n"
-                    "Например: Дата:date"
+                    "/add_tag метка:поле\n"
+                    "Например: /add_tag Дата:date"
                 )
         except Exception as e:
-            logger.error(f"Error in process_new_tag: {e}")
-            await event.reply("Произошла ошибка при обработке новой метки")
+            logger.error(f"Error in handle_add_tag_command: {e}")
+            await event.reply("Произошла ошибка при добавлении метки")
+
+    async def handle_toggle_tag_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /toggle_tag"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/toggle_tag'):
+                return
+                
+            # Извлекаем параметры команды
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.reply(
+                    "Неверный формат. Используйте формат:\n"
+                    "/toggle_tag метка\n"
+                    "Например: /toggle_tag Дата:"
+                )
+                return
+                
+            tag = parts[1].strip()
+            
+            if chat_id not in self.tag_configs:
+                await event.reply("Конфигурация чата не найдена")
+                return
+                
+            tag_found = False
+            for tag_config in self.tag_configs[chat_id]:
+                if tag_config.tag == tag:
+                    tag_config.is_active = not tag_config.is_active
+                    tag_found = True
+                    status = "включена" if tag_config.is_active else "выключена"
+                    await event.reply(f"Метка '{tag}' {status}")
+                    break
+            
+            if not tag_found:
+                await event.reply(f"Метка '{tag}' не найдена")
+                return
+                
+            self.save_chat_config(chat_id)
+        except Exception as e:
+            logger.error(f"Error in handle_toggle_tag_command: {e}")
+            await event.reply("Произошла ошибка при переключении метки")
+
+    async def handle_nlp_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /nlp"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/nlp'):
+                return
+                
+            # Извлекаем параметры команды
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.reply(
+                    "Неверный формат. Используйте формат:\n"
+                    "/nlp on или /nlp off"
+                )
+                return
+                
+            param = parts[1].strip().lower()
+            
+            if param not in ['on', 'off']:
+                await event.reply(
+                    "Неверный параметр. Используйте 'on' или 'off'"
+                )
+                return
+                
+            # Получаем конфигурацию чата
+            config = self.get_chat_config(chat_id)
+            if not config:
+                config = ChatConfig(
+                    chat_id=chat_id,
+                    tags=self.get_active_tags(chat_id),
+                    use_nlp=True,
+                    duplicate_threshold=0.7,
+                    active=True
+                )
+                self.chat_configs[chat_id] = config
+                
+            config.use_nlp = (param == 'on')
+            self.update_chat_config(chat_id, config)
+            
+            status = "включен" if config.use_nlp else "выключен"
+            await event.reply(f"NLP {status}")
+        except Exception as e:
+            logger.error(f"Error in handle_nlp_command: {e}")
+            await event.reply("Произошла ошибка при изменении настройки NLP")
+
+    async def handle_threshold_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /threshold"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/threshold'):
+                return
+                
+            # Извлекаем параметры команды
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.reply(
+                    "Неверный формат. Используйте формат:\n"
+                    "/threshold 0.7"
+                )
+                return
+                
+            try:
+                threshold = float(parts[1].strip())
+                if threshold < 0 or threshold > 1:
+                    await event.reply(
+                        "Порог должен быть числом от 0 до 1"
+                    )
+                    return
+                    
+                # Получаем конфигурацию чата
+                config = self.get_chat_config(chat_id)
+                if not config:
+                    config = ChatConfig(
+                        chat_id=chat_id,
+                        tags=self.get_active_tags(chat_id),
+                        use_nlp=True,
+                        duplicate_threshold=threshold,
+                        active=True
+                    )
+                    self.chat_configs[chat_id] = config
+                else:
+                    config.duplicate_threshold = threshold
+                    self.update_chat_config(chat_id, config)
+                    
+                await event.reply(f"Порог дубликатов установлен на {threshold}")
+            except ValueError:
+                await event.reply(
+                    "Неверный формат. Используйте число от 0 до 1"
+                )
+        except Exception as e:
+            logger.error(f"Error in handle_threshold_command: {e}")
+            await event.reply("Произошла ошибка при установке порога дубликатов")
+
+    async def handle_status_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /status"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/status'):
+                return
+                
+            # Получаем конфигурацию чата
+            config = self.get_chat_config(chat_id)
+            if not config:
+                config = ChatConfig(
+                    chat_id=chat_id,
+                    tags=self.get_active_tags(chat_id),
+                    use_nlp=True,
+                    duplicate_threshold=0.7,
+                    active=True
+                )
+                self.chat_configs[chat_id] = config
+                
+            # Получаем активные метки
+            active_tags = self.get_active_tags(chat_id)
+            
+            status_text = (
+                f"Статус бота:\n"
+                f"NLP: {'включен' if config.use_nlp else 'выключен'}\n"
+                f"Порог дубликатов: {config.duplicate_threshold}\n"
+                f"Активные метки: {len(active_tags)}\n\n"
+                f"Список активных меток:\n"
+            )
+            
+            for tag, field in active_tags.items():
+                status_text += f"{tag} -> {field}\n"
+                
+            await event.reply(status_text)
+        except Exception as e:
+            logger.error(f"Error in handle_status_command: {e}")
+            await event.reply("Произошла ошибка при получении статуса")
+
+    async def handle_data_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /data для просмотра данных из базы"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/data'):
+                return
+                
+            # Извлекаем параметры команды
+            parts = message.text.split(maxsplit=1)
+            limit = 10  # По умолчанию показываем 10 записей
+            
+            if len(parts) > 1:
+                try:
+                    limit = int(parts[1].strip())
+                    if limit <= 0:
+                        limit = 10
+                    if limit > 50:  # Ограничиваем максимальное количество записей
+                        limit = 50
+                except ValueError:
+                    await event.reply(
+                        "Неверный формат. Используйте число, например: /data 20"
+                    )
+                    return
+            
+            # Получаем данные из базы
+            messages = session.query(DBMessage).order_by(DBMessage.timestamp.desc()).limit(limit).all()
+            
+            if not messages:
+                await event.reply("В базе данных нет записей.")
+                return
+                
+            # Формируем сообщение с данными
+            data_text = f"Последние {len(messages)} записей из базы данных:\n\n"
+            
+            for i, msg in enumerate(messages, 1):
+                data_text += f"Запись #{i} (ID: {msg.id}):\n"
+                data_text += f"Чат: {msg.chat_id}\n"
+                data_text += f"Время: {msg.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                
+                # Добавляем извлеченные данные
+                if msg.date:
+                    data_text += f"Дата: {msg.date}\n"
+                if msg.address:
+                    data_text += f"Адрес: {msg.address}\n"
+                if msg.name:
+                    data_text += f"Имя: {msg.name}\n"
+                if msg.phone:
+                    data_text += f"Телефон: {msg.phone}\n"
+                
+                # Добавляем исходный текст сообщения (сокращенный)
+                if msg.message_text:
+                    text_preview = msg.message_text[:100] + "..." if len(msg.message_text) > 100 else msg.message_text
+                    data_text += f"Текст: {text_preview}\n"
+                
+                data_text += "\n" + "-" * 30 + "\n\n"
+            
+            # Отправляем данные частями, если они слишком длинные
+            if len(data_text) > 4000:
+                parts = [data_text[i:i+4000] for i in range(0, len(data_text), 4000)]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        await event.reply(part)
+                    else:
+                        await self.client.send_message(chat_id, part)
+            else:
+                await event.reply(data_text)
+                
+        except Exception as e:
+            logger.error(f"Error in handle_data_command: {e}")
+            await event.reply("Произошла ошибка при получении данных из базы.")
+
+    async def handle_data_chat_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /data_chat для просмотра данных из базы для конкретного чата"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/data_chat'):
+                return
+                
+            # Извлекаем параметры команды
+            parts = message.text.split(maxsplit=2)
+            if len(parts) < 2:
+                await event.reply(
+                    "Неверный формат. Используйте формат:\n"
+                    "/data_chat chat_id [limit]\n"
+                    "Например: /data_chat 123456789 20"
+                )
+                return
+                
+            try:
+                target_chat_id = int(parts[1].strip())
+                limit = 10  # По умолчанию показываем 10 записей
+                
+                if len(parts) > 2:
+                    try:
+                        limit = int(parts[2].strip())
+                        if limit <= 0:
+                            limit = 10
+                        if limit > 50:  # Ограничиваем максимальное количество записей
+                            limit = 50
+                    except ValueError:
+                        await event.reply(
+                            "Неверный формат лимита. Используйте число, например: /data_chat 123456789 20"
+                        )
+                        return
+                
+                # Получаем данные из базы для конкретного чата
+                messages = session.query(DBMessage).filter_by(chat_id=target_chat_id).order_by(DBMessage.timestamp.desc()).limit(limit).all()
+                
+                if not messages:
+                    await event.reply(f"В базе данных нет записей для чата {target_chat_id}.")
+                    return
+                    
+                # Формируем сообщение с данными
+                data_text = f"Последние {len(messages)} записей из базы данных для чата {target_chat_id}:\n\n"
+                
+                for i, msg in enumerate(messages, 1):
+                    data_text += f"Запись #{i} (ID: {msg.id}):\n"
+                    data_text += f"Время: {msg.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    
+                    # Добавляем извлеченные данные
+                    if msg.date:
+                        data_text += f"Дата: {msg.date}\n"
+                    if msg.address:
+                        data_text += f"Адрес: {msg.address}\n"
+                    if msg.name:
+                        data_text += f"Имя: {msg.name}\n"
+                    if msg.phone:
+                        data_text += f"Телефон: {msg.phone}\n"
+                    
+                    # Добавляем исходный текст сообщения (сокращенный)
+                    if msg.message_text:
+                        text_preview = msg.message_text[:100] + "..." if len(msg.message_text) > 100 else msg.message_text
+                        data_text += f"Текст: {text_preview}\n"
+                    
+                    data_text += "\n" + "-" * 30 + "\n\n"
+                
+                # Отправляем данные частями, если они слишком длинные
+                if len(data_text) > 4000:
+                    parts = [data_text[i:i+4000] for i in range(0, len(data_text), 4000)]
+                    for i, part in enumerate(parts):
+                        if i == 0:
+                            await event.reply(part)
+                        else:
+                            await self.client.send_message(chat_id, part)
+                else:
+                    await event.reply(data_text)
+                    
+            except ValueError:
+                await event.reply(
+                    "Неверный формат ID чата. Используйте число, например: /data_chat 123456789"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in handle_data_chat_command: {e}")
+            await event.reply("Произошла ошибка при получении данных из базы.")
+
+    async def handle_export_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /export для экспорта данных в CSV файл"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/export'):
+                return
+                
+            # Получаем все данные из базы
+            messages = session.query(DBMessage).order_by(DBMessage.timestamp.desc()).all()
+            
+            if not messages:
+                await event.reply("В базе данных нет записей для экспорта.")
+                return
+                
+            # Создаем временный CSV файл
+            import csv
+            import tempfile
+            import os
+            
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8') as temp_file:
+                writer = csv.writer(temp_file)
+                
+                # Записываем заголовки
+                writer.writerow(['ID', 'Chat ID', 'Timestamp', 'Date', 'Address', 'Name', 'Phone', 'Message Text'])
+                
+                # Записываем данные
+                for msg in messages:
+                    writer.writerow([
+                        msg.id,
+                        msg.chat_id,
+                        msg.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                        msg.date or '',
+                        msg.address or '',
+                        msg.name or '',
+                        msg.phone or '',
+                        msg.message_text or ''
+                    ])
+                
+                temp_file_path = temp_file.name
+            
+            # Отправляем файл
+            await event.reply(f"Экспортировано {len(messages)} записей в CSV файл.")
+            await self.client.send_file(chat_id, temp_file_path, caption="Данные из базы")
+            
+            # Удаляем временный файл
+            os.unlink(temp_file_path)
+                
+        except Exception as e:
+            logger.error(f"Error in handle_export_command: {e}")
+            await event.reply("Произошла ошибка при экспорте данных в CSV файл.")
+
+    def get_chat_config(self, chat_id: int) -> Optional[ChatConfig]:
+        """Получает конфигурацию чата"""
+        if chat_id not in self.chat_configs:
+            # Создаем новую конфигурацию с активными метками
+            active_tags = self.get_active_tags(chat_id)
+            self.chat_configs[chat_id] = ChatConfig(
+                chat_id=chat_id,
+                tags=active_tags,
+                use_nlp=True,
+                duplicate_threshold=0.7,
+                active=True
+            )
+        return self.chat_configs.get(chat_id)
+
+    def update_chat_config(self, chat_id: int, config: ChatConfig):
+        """Обновляет конфигурацию чата"""
+        self.chat_configs[chat_id] = config
 
     def get_active_tags(self, chat_id: int) -> Dict[str, str]:
         """Возвращает активные метки для чата"""
@@ -261,7 +614,6 @@ class MessageProcessor:
     def __init__(self):
         self.message_queue = queue.Queue()
         self.processing_threads = []
-        self.chat_configs = {}
         self.client = None
         self.chat_manager = None
 
@@ -275,42 +627,46 @@ class MessageProcessor:
         message_text = message.text
         
         if not message_text:
+            logger.info(f"Empty message received from chat {chat_id}")
             return
 
-        # Обработка команды /config
-        if message_text.startswith('/config'):
-            await self.chat_manager.handle_config_command(event)
-            return
-
-        # Обработка новой метки
-        if self.chat_manager.waiting_for_tag.get(chat_id, False):
-            await self.chat_manager.process_new_tag(event)
+        # Обработка команд
+        if message_text.startswith('/'):
+            logger.info(f"Command received from chat {chat_id}: {message_text}")
+            if message_text.startswith('/config'):
+                await self.chat_manager.handle_config_command(event)
+            elif message_text.startswith('/tags'):
+                await self.chat_manager.handle_tags_command(event)
+            elif message_text.startswith('/add_tag'):
+                await self.chat_manager.handle_add_tag_command(event)
+            elif message_text.startswith('/toggle_tag'):
+                await self.chat_manager.handle_toggle_tag_command(event)
+            elif message_text.startswith('/nlp'):
+                await self.chat_manager.handle_nlp_command(event)
+            elif message_text.startswith('/threshold'):
+                await self.chat_manager.handle_threshold_command(event)
+            elif message_text.startswith('/status'):
+                await self.chat_manager.handle_status_command(event)
+            elif message_text.startswith('/data'):
+                await self.chat_manager.handle_data_command(event)
+            elif message_text.startswith('/data_chat'):
+                await self.chat_manager.handle_data_chat_command(event)
+            elif message_text.startswith('/export'):
+                await self.chat_manager.handle_export_command(event)
             return
 
         # Получение конфигурации чата
-        config = self.get_chat_config(chat_id)
-        if not config or not config.active:
+        config = self.chat_manager.get_chat_config(chat_id)
+        if not config:
+            logger.info(f"No config found for chat {chat_id}")
+            return
+        if not config.active:
+            logger.info(f"Chat {chat_id} is not active")
             return
 
         # Добавление сообщения в очередь обработки
+        logger.info(f"Adding message to queue from chat {chat_id}: {message_text[:100]}...")
         self.message_queue.put((chat_id, message_text, datetime.now()))
-
-    def get_chat_config(self, chat_id: int) -> Optional[ChatConfig]:
-        """Получает конфигурацию чата"""
-        if chat_id not in self.chat_configs:
-            # Создаем новую конфигурацию с активными метками
-            active_tags = self.chat_manager.get_active_tags(chat_id)
-            self.chat_configs[chat_id] = ChatConfig(
-                chat_id=chat_id,
-                tags=active_tags,
-                use_nlp=True,
-                duplicate_threshold=0.7,
-                active=True
-            )
-        return self.chat_configs.get(chat_id)
-
-    def update_chat_config(self, chat_id: int, config: ChatConfig):
-        self.chat_configs[chat_id] = config
 
     def extract_data_with_tags(self, text: str, tags: Dict[str, str]) -> Dict:
         extracted_data = {}
@@ -326,57 +682,92 @@ class MessageProcessor:
         return extracted_data
 
     def extract_data_with_nlp(self, text: str) -> Dict:
-        doc = nlp_processor.extract_data(text)
-        return doc
+        """Извлекает данные из текста с помощью NLP"""
+        try:
+            if not nlp_processor:
+                logger.warning("NLP processor not initialized")
+                return {}
+                
+            doc = nlp_processor.extract_data(text)
+            logger.info(f"NLP extracted data from text '{text[:100]}...': {doc}")
+            return doc
+        except Exception as e:
+            logger.error(f"Error in NLP extraction: {e}")
+            return {}
 
     def check_duplicates(self, data: Dict, chat_id: int) -> bool:
-        # Check for duplicates based on key fields
-        existing = messages_collection.find_one({
-            "chat_id": chat_id,
-            "date": data.get("date"),
-            "address": data.get("address")
-        })
+        """Проверяет наличие дубликатов в базе данных"""
+        # Создаем базовый запрос
+        query = session.query(DBMessage).filter_by(chat_id=chat_id)
+        
+        # Добавляем условия только для непустых полей
+        if data.get("date"):
+            query = query.filter_by(date=data["date"])
+        if data.get("address"):
+            query = query.filter_by(address=data["address"])
+        if data.get("name"):
+            query = query.filter_by(name=data["name"])
+        if data.get("phone"):
+            query = query.filter_by(phone=data["phone"])
+            
+        # Проверяем наличие дубликатов
+        existing = query.first()
         return existing is not None
 
     def process_queue(self):
         while True:
             try:
                 chat_id, message_text, timestamp = self.message_queue.get()
-                config = self.get_chat_config(chat_id)
+                logger.info(f"Processing message from chat {chat_id}: {message_text[:100]}...")
                 
+                # Получаем конфигурацию чата
+                config = self.chat_manager.get_chat_config(chat_id)
                 if not config:
+                    logger.warning(f"No config found for chat {chat_id} during processing")
+                    continue
+                if not config.active:
+                    logger.info(f"Chat {chat_id} is not active")
                     continue
 
                 extracted_data = {}
                 
-                # Сначала используем NLP для извлечения данных
-                if config.use_nlp:
+                # Используем NLP если включено
+                if config.use_nlp and nlp_processor:
+                    logger.info(f"Using NLP for chat {chat_id}")
                     nlp_data = self.extract_data_with_nlp(message_text)
-                    extracted_data.update(nlp_data)
+                    if nlp_data:
+                        extracted_data.update(nlp_data)
+                        logger.info(f"NLP extracted data: {nlp_data}")
                 
-                # Затем используем метки только для полей, которые не были определены NLP
+                # Используем теги для оставшихся полей
                 if config.tags:
+                    logger.info(f"Using tags for chat {chat_id}")
                     tag_data = self.extract_data_with_tags(message_text, config.tags)
-                    for field, value in tag_data.items():
-                        if field not in extracted_data:
-                            extracted_data[field] = value
+                    if tag_data:
+                        for field, value in tag_data.items():
+                            if field not in extracted_data:
+                                extracted_data[field] = value
+                        logger.info(f"Tag extracted data: {tag_data}")
 
-                # Check for duplicates
-                if self.check_duplicates(extracted_data, chat_id):
+                # Проверяем дубликаты только если есть извлеченные данные
+                if extracted_data and self.check_duplicates(extracted_data, chat_id):
                     logger.info(f"Duplicate message detected in chat {chat_id}")
                     continue
 
-                # Save to database
-                message_data = {
-                    "chat_id": chat_id,
-                    "timestamp": timestamp,
+                # Сохраняем в базу данных
+                message = DBMessage(
+                    chat_id=chat_id,
+                    message_text=message_text,
+                    timestamp=timestamp,
                     **extracted_data
-                }
-                messages_collection.insert_one(message_data)
-                logger.info(f"Processed message from chat {chat_id}")
+                )
+                session.add(message)
+                session.commit()
+                logger.info(f"Successfully saved message from chat {chat_id} with data: {extracted_data}")
 
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
+                session.rollback()
 
     def start_processing(self, num_threads: int = 3):
         for _ in range(num_threads):
@@ -410,23 +801,6 @@ async def main():
                 await processor.process_message(event)
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
-
-        @client.on(events.CallbackQuery())
-        async def callback_handler(event):
-            try:
-                data = event.data.decode('utf-8')
-                if data == "manage_tags":
-                    await processor.chat_manager.handle_tag_management(event)
-                elif data.startswith("toggle_tag_"):
-                    tag = data.replace("toggle_tag_", "")
-                    await processor.chat_manager.toggle_tag(event, tag)
-                elif data == "add_tag":
-                    await processor.chat_manager.add_tag(event)
-                elif data == "back_to_main":
-                    await processor.chat_manager.handle_config_command(event)
-            except Exception as e:
-                logger.error(f"Error handling callback: {e}")
-                await event.answer("Произошла ошибка при обработке команды")
 
         # Start the client
         await client.start()
