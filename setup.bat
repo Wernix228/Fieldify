@@ -2,6 +2,7 @@ py -3.11 -m venv venv
 call .\venv\Scripts\activate
 pip install spacy==3.7.2
 python -m spacy download ru_core_news_sm
+pip install matplotlib
 pip install -r .\requirements.txt
 mkdir configs
 (
