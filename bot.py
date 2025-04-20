@@ -13,6 +13,7 @@ import threading
 import queue
 from nlp_processor import NLPProcessor
 from database import session, Message as DBMessage, ChatConfig as DBChatConfig
+from text_processor import TextProcessor
 
 # Load environment variables
 load_dotenv()
@@ -616,6 +617,7 @@ class MessageProcessor:
         self.processing_threads = []
         self.client = None
         self.chat_manager = None
+        self.text_processor = TextProcessor(os.getenv("NOVITA_API_KEY"))
 
     def set_client(self, client: TelegramClient):
         self.client = client
@@ -668,6 +670,63 @@ class MessageProcessor:
         logger.info(f"Adding message to queue from chat {chat_id}: {message_text[:100]}...")
         self.message_queue.put((chat_id, message_text, datetime.now()))
 
+    def process_queue(self):
+        while True:
+            try:
+                chat_id, message_text, timestamp = self.message_queue.get()
+                logger.info(f"Processing message from chat {chat_id}: {message_text[:100]}...")
+                
+                # Получаем конфигурацию чата
+                config = self.chat_manager.get_chat_config(chat_id)
+                if not config:
+                    logger.warning(f"No config found for chat {chat_id} during processing")
+                    continue
+                if not config.active:
+                    logger.info(f"Chat {chat_id} is not active")
+                    continue
+
+                extracted_data = {}
+                
+                # Используем AI для обработки текста
+                ai_data = asyncio.run(self.text_processor.process_text_with_ai(message_text))
+                if ai_data:
+                    extracted_data.update(ai_data)
+                    logger.info(f"AI extracted data: {ai_data}")
+
+                # Проверяем дубликаты с помощью Levenshtein distance
+                if self.check_duplicates_with_levenshtein(message_text, chat_id, config.duplicate_threshold):
+                    logger.info(f"Duplicate message detected in chat {chat_id} using Levenshtein distance")
+                    continue
+
+                # Сохраняем в базу данных
+                message = DBMessage(
+                    chat_id=chat_id,
+                    message_text=message_text,
+                    timestamp=timestamp,
+                    **extracted_data
+                )
+                session.add(message)
+                session.commit()
+                logger.info(f"Successfully saved message from chat {chat_id} with data: {extracted_data}")
+
+            except Exception as e:
+                logger.error(f"Error processing message: {e}")
+                session.rollback()
+
+    def check_duplicates_with_levenshtein(self, text: str, chat_id: int, threshold: float) -> bool:
+        """Проверяет наличие дубликатов с помощью расстояния Левенштейна"""
+        try:
+            # Получаем последние N сообщений из базы данных
+            recent_messages = session.query(DBMessage).filter_by(chat_id=chat_id).order_by(DBMessage.timestamp.desc()).limit(10).all()
+            
+            for msg in recent_messages:
+                if self.text_processor.is_similar(text, msg.message_text, threshold):
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking duplicates with Levenshtein: {e}")
+            return False
+
     def extract_data_with_tags(self, text: str, tags: Dict[str, str]) -> Dict:
         extracted_data = {}
         for tag, field in tags.items():
@@ -713,61 +772,6 @@ class MessageProcessor:
         # Проверяем наличие дубликатов
         existing = query.first()
         return existing is not None
-
-    def process_queue(self):
-        while True:
-            try:
-                chat_id, message_text, timestamp = self.message_queue.get()
-                logger.info(f"Processing message from chat {chat_id}: {message_text[:100]}...")
-                
-                # Получаем конфигурацию чата
-                config = self.chat_manager.get_chat_config(chat_id)
-                if not config:
-                    logger.warning(f"No config found for chat {chat_id} during processing")
-                    continue
-                if not config.active:
-                    logger.info(f"Chat {chat_id} is not active")
-                    continue
-
-                extracted_data = {}
-                
-                # Используем NLP если включено
-                if config.use_nlp and nlp_processor:
-                    logger.info(f"Using NLP for chat {chat_id}")
-                    nlp_data = self.extract_data_with_nlp(message_text)
-                    if nlp_data:
-                        extracted_data.update(nlp_data)
-                        logger.info(f"NLP extracted data: {nlp_data}")
-                
-                # Используем теги для оставшихся полей
-                if config.tags:
-                    logger.info(f"Using tags for chat {chat_id}")
-                    tag_data = self.extract_data_with_tags(message_text, config.tags)
-                    if tag_data:
-                        for field, value in tag_data.items():
-                            if field not in extracted_data:
-                                extracted_data[field] = value
-                        logger.info(f"Tag extracted data: {tag_data}")
-
-                # Проверяем дубликаты только если есть извлеченные данные
-                if extracted_data and self.check_duplicates(extracted_data, chat_id):
-                    logger.info(f"Duplicate message detected in chat {chat_id}")
-                    continue
-
-                # Сохраняем в базу данных
-                message = DBMessage(
-                    chat_id=chat_id,
-                    message_text=message_text,
-                    timestamp=timestamp,
-                    **extracted_data
-                )
-                session.add(message)
-                session.commit()
-                logger.info(f"Successfully saved message from chat {chat_id} with data: {extracted_data}")
-
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
-                session.rollback()
 
     def start_processing(self, num_threads: int = 3):
         for _ in range(num_threads):
