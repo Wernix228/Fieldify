@@ -2,6 +2,15 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+import os
+from pathlib import Path
+
+# Определяем базовые пути
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / 'data'
+
+# Создаем папку data, если её нет
+os.makedirs(DATA_DIR, exist_ok=True)
 
 Base = declarative_base()
 
@@ -26,8 +35,9 @@ class ChatConfig(Base):
     duplicate_threshold = Column(Float, default=0.7)
     active = Column(Boolean, default=True)
 
-# Создаем движок базы данных
-engine = create_engine('sqlite:///bot_database.db')
+# Изменяем путь к базе данных
+db_path = DATA_DIR / 'bot_database.db'
+engine = create_engine(f'sqlite:///{db_path}')
 
 # Создаем все таблицы
 Base.metadata.create_all(engine)

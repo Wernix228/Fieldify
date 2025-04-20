@@ -14,9 +14,21 @@ import queue
 from nlp_processor import NLPProcessor
 from database import session, Message as DBMessage, ChatConfig as DBChatConfig
 from text_processor import TextProcessor
+import json
+from pathlib import Path
 
-# Load environment variables
-load_dotenv()
+# Определяем базовые пути
+BASE_DIR = Path(__file__).resolve().parent
+CONFIGS_DIR = BASE_DIR / 'configs'
+DATA_DIR = BASE_DIR / 'data'
+
+# Создаем необходимые директории
+os.makedirs(CONFIGS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Загружаем переменные окружения из configs/.env
+env_path = CONFIGS_DIR / '.env'
+load_dotenv(env_path)
 
 # Configure logging
 logging.basicConfig(
@@ -85,6 +97,42 @@ class ChatManager:
             logger.error(f"Error saving chat config: {e}")
             session.rollback()
 
+    def save_tags_to_json(self, chat_id: int):
+        """Сохраняет метки в JSON файлы"""
+        try:
+            # Сохраняем метки в tags.json
+            tags_data = {}
+            tags_file = DATA_DIR / 'tags.json'
+            if tags_file.exists():
+                with open(tags_file, 'r', encoding='utf-8') as f:
+                    tags_data = json.load(f)
+            
+            if chat_id in self.tag_configs:
+                tags_data[str(chat_id)] = {
+                    tag.tag: tag.field 
+                    for tag in self.tag_configs[chat_id]
+                }
+            
+            with open(tags_file, 'w', encoding='utf-8') as f:
+                json.dump(tags_data, f, ensure_ascii=False, indent=2)
+                
+            # Для tag_values.json не создаем пустые списки
+            tag_values_file = DATA_DIR / 'tag_values.json'
+            if tag_values_file.exists():
+                with open(tag_values_file, 'r', encoding='utf-8') as f:
+                    tag_values = json.load(f)
+            else:
+                tag_values = {}
+                
+            if str(chat_id) not in tag_values:
+                tag_values[str(chat_id)] = {}
+                
+            with open(tag_values_file, 'w', encoding='utf-8') as f:
+                json.dump(tag_values, f, ensure_ascii=False, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Error saving tags to JSON: {e}")
+
     async def handle_config_command(self, event: events.NewMessage.Event):
         """Обрабатывает команду /config"""
         try:
@@ -100,10 +148,13 @@ class ChatManager:
                 "/tags - управление метками\n"
                 "/add_tag метка:поле - добавить новую метку\n"
                 "/toggle_tag метка - включить/выключить метку\n"
+                "/show_tags - показать все метки\n"
+                "/show_values - показать все значения меток\n"
+                "/show_tag_values метка - показать значения конкретной метки\n"
                 "/nlp on/off - включить/выключить NLP\n"
                 "/threshold 0.7 - установить порог дубликатов\n"
                 "/status - показать статус бота\n"
-                "/data [limit] - показать последние извлеченные данные (по умолчанию 10)\n"
+                "/data [limit] - показать последние извлеченные данные\n"
                 "/data_chat chat_id [limit] - показать данные для конкретного чата\n"
                 "/export - экспортировать все данные в CSV файл"
             )
@@ -176,6 +227,7 @@ class ChatManager:
                 
                 self.tag_configs[chat_id].append(new_config)
                 self.save_chat_config(chat_id)
+                self.save_tags_to_json(chat_id)  # Сохраняем в JSON
                 
                 await event.reply(f"Метка {tag} успешно добавлена!")
                 
@@ -573,7 +625,7 @@ class ChatManager:
             
             # Отправляем файл
             await event.reply(f"Экспортировано {len(messages)} записей в CSV файл.")
-            await self.client.send_file(chat_id, temp_file_path, caption="Данные из базы")
+            await self.client.send_file(chat_id, temp_file_path, comment="Данные из базы")
             
             # Удаляем временный файл
             os.unlink(temp_file_path)
@@ -581,6 +633,167 @@ class ChatManager:
         except Exception as e:
             logger.error(f"Error in handle_export_command: {e}")
             await event.reply("Произошла ошибка при экспорте данных в CSV файл.")
+
+    async def handle_show_tags_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /show_tags - показывает содержимое tags.json"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/show_tags'):
+                return
+
+            tags_file = DATA_DIR / 'tags.json'
+            if not tags_file.exists():
+                await event.reply("Файл с метками пуст или не существует.")
+                return
+
+            with open(tags_file, 'r', encoding='utf-8') as f:
+                tags_data = json.load(f)
+
+            # Форматируем данные для текущего чата
+            if str(chat_id) in tags_data:
+                chat_tags = tags_data[str(chat_id)]
+                response = "Список меток:\n\n"
+                for tag, field in chat_tags.items():
+                    response += f"Метка: {tag}\nПоле: {field}\n\n"
+            else:
+                response = "Для этого чата нет сохраненных меток."
+
+            # Отправляем ответ
+            await event.reply(response)
+
+            # Отправляем файл JSON с правильным параметром comment
+            with open(tags_file, 'rb') as f:
+                await event.reply(file=f, comment="Файл со всеми метками (tags.json)")
+
+        except Exception as e:
+            logger.error(f"Error in handle_show_tags_command: {e}")
+            await event.reply("Произошла ошибка при получении меток.")
+
+    async def handle_show_values_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /show_values - показывает содержимое tag_values.json"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/show_values'):
+                return
+
+            values_file = DATA_DIR / 'tag_values.json'
+            if not values_file.exists():
+                await event.reply("Файл со значениями меток пуст или не существует.")
+                return
+
+            with open(values_file, 'r', encoding='utf-8') as f:
+                values_data = json.load(f)
+
+            # Форматируем данные для текущего чата
+            if str(chat_id) in values_data:
+                chat_values = values_data[str(chat_id)]
+                response = "Значения меток:\n\n"
+                for field, values in chat_values.items():
+                    response += f"Поле: {field}\nЗначения:\n"
+                    for value in values:
+                        response += f"- {value}\n"
+                    response += "\n"
+            else:
+                response = "Для этого чата нет сохраненных значений."
+
+            # Отправляем ответ
+            await event.reply(response)
+
+            # Отправляем файл JSON с правильным параметром comment
+            with open(values_file, 'rb') as f:
+                await event.reply(file=f, comment="Файл со всеми значениями (tag_values.json)")
+
+        except Exception as e:
+            logger.error(f"Error in handle_show_values_command: {e}")
+            await event.reply("Произошла ошибка при получении значений меток.")
+
+    async def handle_show_tag_values_command(self, event: events.NewMessage.Event):
+        """Обрабатывает команду /show_tag_values tag - показывает значения конкретной метки"""
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            
+            if not message.text.startswith('/show_tag_values'):
+                return
+
+            # Получаем имя метки из команды
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.reply(
+                    "Неверный формат. Используйте:\n"
+                    "/show_tag_values метка\n"
+                    "Например: /show_tag_values password"
+                )
+                return
+
+            tag_name = parts[1].strip()
+
+            # Загружаем оба файла для поиска
+            tags_file = DATA_DIR / 'tags.json'
+            values_file = DATA_DIR / 'tag_values.json'
+
+            if not tags_file.exists() or not values_file.exists():
+                await event.reply("Файлы с метками или значениями не существуют.")
+                return
+
+            with open(tags_file, 'r', encoding='utf-8') as f:
+                tags_data = json.load(f)
+
+            with open(values_file, 'r', encoding='utf-8') as f:
+                values_data = json.load(f)
+
+            # Ищем поле для указанной метки
+            field = None
+            if str(chat_id) in tags_data:
+                chat_tags = tags_data[str(chat_id)]
+                for tag, tag_field in chat_tags.items():
+                    if tag == tag_name:
+                        field = tag_field
+                        break
+
+            if not field:
+                await event.reply(f"Метка '{tag_name}' не найдена в конфигурации чата.")
+                return
+
+            # Получаем значения для найденного поля
+            if str(chat_id) in values_data and field in values_data[str(chat_id)]:
+                values = values_data[str(chat_id)][field]
+                
+                # Создаем временный JSON файл с значениями конкретной метки
+                temp_data = {
+                    "tag": tag_name,
+                    "field": field,
+                    "values": values
+                }
+                
+                temp_file = DATA_DIR / f'temp_{field}_values.json'
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(temp_data, f, ensure_ascii=False, indent=2)
+
+                # Формируем текстовый ответ
+                response = f"Значения для метки '{tag_name}' (поле: {field}):\n\n"
+                for value in values:
+                    response += f"- {value}\n"
+
+                # Отправляем ответ
+                await event.reply(response)
+
+                # Отправляем файл JSON с правильным параметром comment
+                with open(temp_file, 'rb') as f:
+                    await event.reply(file=f, comment=f"Значения метки {tag_name}")
+
+                # Удаляем временный файл
+                temp_file.unlink()
+            else:
+                await event.reply(f"Для метки '{tag_name}' нет сохраненных значений.")
+
+        except Exception as e:
+            logger.error(f"Error in handle_show_tag_values_command: {e}")
+            await event.reply("Произошла ошибка при получении значений метки.")
 
     def get_chat_config(self, chat_id: int) -> Optional[ChatConfig]:
         """Получает конфигурацию чата"""
@@ -624,51 +837,59 @@ class MessageProcessor:
         self.chat_manager = ChatManager(client)
 
     async def process_message(self, event: events.NewMessage.Event):
-        message: Message = event.message
-        chat_id = message.chat_id
-        message_text = message.text
-        
-        if not message_text:
-            logger.info(f"Empty message received from chat {chat_id}")
-            return
+        try:
+            message: Message = event.message
+            chat_id = message.chat_id
+            message_text = message.text
+            
+            if not message_text:
+                return
 
-        # Обработка команд
-        if message_text.startswith('/'):
-            logger.info(f"Command received from chat {chat_id}: {message_text}")
-            if message_text.startswith('/config'):
-                await self.chat_manager.handle_config_command(event)
-            elif message_text.startswith('/tags'):
-                await self.chat_manager.handle_tags_command(event)
-            elif message_text.startswith('/add_tag'):
-                await self.chat_manager.handle_add_tag_command(event)
-            elif message_text.startswith('/toggle_tag'):
-                await self.chat_manager.handle_toggle_tag_command(event)
-            elif message_text.startswith('/nlp'):
-                await self.chat_manager.handle_nlp_command(event)
-            elif message_text.startswith('/threshold'):
-                await self.chat_manager.handle_threshold_command(event)
-            elif message_text.startswith('/status'):
-                await self.chat_manager.handle_status_command(event)
-            elif message_text.startswith('/data'):
-                await self.chat_manager.handle_data_command(event)
-            elif message_text.startswith('/data_chat'):
-                await self.chat_manager.handle_data_chat_command(event)
-            elif message_text.startswith('/export'):
-                await self.chat_manager.handle_export_command(event)
-            return
+            # Обработка команд
+            if message_text.startswith('/'):
+                if message_text.startswith('/show_tags'):
+                    await self.chat_manager.handle_show_tags_command(event)
+                elif message_text.startswith('/show_values'):
+                    await self.chat_manager.handle_show_values_command(event)
+                elif message_text.startswith('/show_tag_values'):
+                    await self.chat_manager.handle_show_tag_values_command(event)
+                elif message_text.startswith('/config'):
+                    await self.chat_manager.handle_config_command(event)
+                elif message_text.startswith('/tags'):
+                    await self.chat_manager.handle_tags_command(event)
+                elif message_text.startswith('/add_tag'):
+                    await self.chat_manager.handle_add_tag_command(event)
+                elif message_text.startswith('/toggle_tag'):
+                    await self.chat_manager.handle_toggle_tag_command(event)
+                elif message_text.startswith('/nlp'):
+                    await self.chat_manager.handle_nlp_command(event)
+                elif message_text.startswith('/threshold'):
+                    await self.chat_manager.handle_threshold_command(event)
+                elif message_text.startswith('/status'):
+                    await self.chat_manager.handle_status_command(event)
+                elif message_text.startswith('/data'):
+                    await self.chat_manager.handle_data_command(event)
+                elif message_text.startswith('/data_chat'):
+                    await self.chat_manager.handle_data_chat_command(event)
+                elif message_text.startswith('/export'):
+                    await self.chat_manager.handle_export_command(event)
+                return
 
-        # Получение конфигурации чата
-        config = self.chat_manager.get_chat_config(chat_id)
-        if not config:
-            logger.info(f"No config found for chat {chat_id}")
-            return
-        if not config.active:
-            logger.info(f"Chat {chat_id} is not active")
-            return
+            # Получение конфигурации чата
+            config = self.chat_manager.get_chat_config(chat_id)
+            if not config:
+                logger.info(f"No config found for chat {chat_id}")
+                return
+            if not config.active:
+                logger.info(f"Chat {chat_id} is not active")
+                return
 
-        # Добавление сообщения в очередь обработки
-        logger.info(f"Adding message to queue from chat {chat_id}: {message_text[:100]}...")
-        self.message_queue.put((chat_id, message_text, datetime.now()))
+            # Добавление сообщения в очередь обработки
+            logger.info(f"Adding message to queue from chat {chat_id}: {message_text[:100]}...")
+            self.message_queue.put((chat_id, message_text, datetime.now()))
+
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
 
     def process_queue(self):
         while True:
@@ -687,11 +908,21 @@ class MessageProcessor:
 
                 extracted_data = {}
                 
+                # Получаем активные метки
+                active_tags = self.chat_manager.get_active_tags(chat_id)
+                if active_tags:
+                    # Извлекаем данные с помощью меток
+                    tag_data = self.extract_data_with_tags(message_text, active_tags, chat_id)
+                    if tag_data:
+                        extracted_data.update(tag_data)
+                        logger.info(f"Tags extracted data: {tag_data}")
+                
                 # Используем AI для обработки текста
-                ai_data = asyncio.run(self.text_processor.process_text_with_ai(message_text))
-                if ai_data:
-                    extracted_data.update(ai_data)
-                    logger.info(f"AI extracted data: {ai_data}")
+                if config.use_nlp:
+                    ai_data = asyncio.run(self.text_processor.process_text_with_ai(message_text))
+                    if ai_data:
+                        extracted_data.update(ai_data)
+                        logger.info(f"AI extracted data: {ai_data}")
 
                 # Проверяем дубликаты с помощью Levenshtein distance
                 if self.check_duplicates_with_levenshtein(message_text, chat_id, config.duplicate_threshold):
@@ -727,7 +958,15 @@ class MessageProcessor:
             logger.error(f"Error checking duplicates with Levenshtein: {e}")
             return False
 
-    def extract_data_with_tags(self, text: str, tags: Dict[str, str]) -> Dict:
+    def extract_data_with_tags(self, text: str, tags: Dict[str, str], chat_id: int) -> Dict:
+        """
+        Извлекает данные из текста с помощью меток
+        
+        Args:
+            text (str): Текст для обработки
+            tags (Dict[str, str]): Словарь меток и их полей
+            chat_id (int): ID чата
+        """
         extracted_data = {}
         for tag, field in tags.items():
             if tag in text:
@@ -737,7 +976,34 @@ class MessageProcessor:
                 if end_idx == -1:
                     end_idx = len(text)
                 value = text[start_idx:end_idx].strip()
-                extracted_data[field] = value
+                
+                if value:  # Проверяем, что значение не пустое
+                    extracted_data[field] = value
+                    
+                    # Сохраняем значение метки в tag_values.json
+                    try:
+                        tag_values = {}
+                        tag_values_file = DATA_DIR / 'tag_values.json'
+                        if tag_values_file.exists():
+                            with open(tag_values_file, 'r', encoding='utf-8') as f:
+                                tag_values = json.load(f)
+                        
+                        chat_id_str = str(chat_id)
+                        if chat_id_str not in tag_values:
+                            tag_values[chat_id_str] = {}
+                        if field not in tag_values[chat_id_str]:
+                            tag_values[chat_id_str][field] = []
+                        
+                        # Добавляем новое значение, если его еще нет
+                        if value not in tag_values[chat_id_str][field]:
+                            tag_values[chat_id_str][field].append(value)
+                        
+                        with open(tag_values_file, 'w', encoding='utf-8') as f:
+                            json.dump(tag_values, f, ensure_ascii=False, indent=2)
+                            
+                    except Exception as e:
+                        logger.error(f"Error saving tag value to JSON: {e}")
+                
         return extracted_data
 
     def extract_data_with_nlp(self, text: str) -> Dict:
@@ -788,8 +1054,11 @@ async def main():
         if not api_id or not api_hash:
             raise ValueError("API_ID and API_HASH environment variables must be set")
             
+        # Путь к файлу сессии в папке configs
+        session_file = CONFIGS_DIR / 'message_processor'
+            
         client = TelegramClient(
-            'message_processor',
+            str(session_file),  # Преобразуем Path в строку
             int(api_id),
             api_hash
         )
